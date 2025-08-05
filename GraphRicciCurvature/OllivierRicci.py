@@ -21,6 +21,7 @@ A class to compute the Ollivier-Ricci curvature of a given NetworkX graph.
 import heapq
 import math
 import multiprocessing as mp
+import platform
 import time
 from functools import lru_cache
 from importlib import util
@@ -33,6 +34,23 @@ import ot
 from .util import logger, set_verbose, cut_graph_by_cutoff, get_rf_metric_cutoff
 
 EPSILON = 1e-7  # to prevent divided by zero
+
+
+def _get_multiprocessing_context():
+    """Get the appropriate multiprocessing context based on the platform.
+    
+    Returns
+    -------
+    str
+        The multiprocessing context to use ('fork' or 'spawn').
+    """
+    # On Windows, only 'spawn' is available
+    if platform.system() == "Windows":
+        return "spawn"
+    # On Unix-like systems (Linux, macOS), prefer 'fork' for better performance
+    else:
+        return "fork"
+
 
 # ---Shared global variables for multiprocessing used.---
 _Gk = nk.graph.Graph()
@@ -352,6 +370,69 @@ def _wrap_compute_single_edge(stuff):
     return _compute_ricci_curvature_single_edge(*stuff)
 
 
+def _init_worker(nx_graph_data, alpha, weight, method, base, exp_power, cache_maxsize, shortest_path, nbr_topk, apsp_data):
+    """Initialize worker process with necessary global variables.
+    
+    This function is called once per worker process to set up the global state
+    that is needed for the computation. This is necessary for the 'spawn' 
+    multiprocessing context used on Windows.
+    
+    Parameters
+    ----------
+    nx_graph_data : tuple
+        NetworkX graph data (nodes, edges with attributes)
+    alpha : float
+        Alpha parameter
+    weight : str
+        Weight attribute name
+    method : str
+        Computation method
+    base : float
+        Base value
+    exp_power : float
+        Exponential power
+    cache_maxsize : int
+        Cache maximum size
+    shortest_path : str
+        Shortest path method
+    nbr_topk : int
+        Number of top neighbors
+    apsp_data : numpy.ndarray
+        All pairs shortest path data
+    """
+    global _Gk, _alpha, _weight, _method, _base, _exp_power, _cache_maxsize, _shortest_path, _nbr_topk, _apsp
+    
+    # Reconstruct NetworkX graph from data and convert to NetworkKit
+    import networkx as nx
+    import networkit as nk
+    
+    nodes, edges_data, is_directed = nx_graph_data
+    G = nx.DiGraph() if is_directed else nx.Graph()
+    G.add_nodes_from(nodes)
+    
+    # Add edges with attributes
+    for edge_data in edges_data:
+        if len(edge_data) == 3:  # (u, v, attrs)
+            u, v, attrs = edge_data
+            G.add_edge(u, v, **attrs)
+        else:  # (u, v)
+            u, v = edge_data
+            G.add_edge(u, v)
+    
+    # Convert to NetworkKit graph
+    _Gk = nk.nxadapter.nx2nk(G, weightAttr=weight)
+    
+    _alpha = alpha
+    _weight = weight
+    _method = method
+    _base = base
+    _exp_power = exp_power
+    _cache_maxsize = cache_maxsize
+    _shortest_path = shortest_path
+    _nbr_topk = nbr_topk
+    _apsp = apsp_data
+
+
 def _compute_ricci_curvature_edges(G: nx.Graph, weight="weight", edge_list=[],
                                    alpha=0.5, method="OTDSinkhornMix",
                                    base=math.e, exp_power=2, proc=mp.cpu_count(), chunksize=None, cache_maxsize=1000000,
@@ -456,19 +537,45 @@ def _compute_ricci_curvature_edges(G: nx.Graph, weight="weight", edge_list=[],
     # Start compute edge Ricci curvature
     t0 = time.time()
 
-    with mp.get_context('fork').Pool(processes=_proc) as pool:
-        # WARNING: Now only fork works, spawn will hang.
+    # Get the appropriate multiprocessing context for the current platform
+    context = _get_multiprocessing_context()
+    
+    # Prepare data for worker initialization (needed for spawn context on Windows)
+    if context == "spawn":
+        # Extract NetworkX graph data for serialization
+        nodes = list(G.nodes())
+        edges_data = [(u, v, G[u][v]) for u, v in G.edges()]
+        is_directed = G.is_directed()
+        nx_graph_data = (nodes, edges_data, is_directed)
+        
+        # Create pool with initializer function
+        with mp.get_context(context).Pool(processes=_proc, 
+                                        initializer=_init_worker,
+                                        initargs=(nx_graph_data, _alpha, _weight, _method, _base, _exp_power, 
+                                                _cache_maxsize, _shortest_path, _nbr_topk, _apsp)) as pool:
+            # Decide chunksize following method in map_async
+            if chunksize is None:
+                chunksize, extra = divmod(len(args), proc * 4)
+                if extra:
+                    chunksize += 1
 
-        # Decide chunksize following method in map_async
-        if chunksize is None:
-            chunksize, extra = divmod(len(args), proc * 4)
-            if extra:
-                chunksize += 1
+            # Compute Ricci curvature for edges
+            result = pool.imap_unordered(_wrap_compute_single_edge, args, chunksize=chunksize)
+            pool.close()
+            pool.join()
+    else:
+        # Use fork context (Unix-like systems) - no initializer needed
+        with mp.get_context(context).Pool(processes=_proc) as pool:
+            # Decide chunksize following method in map_async
+            if chunksize is None:
+                chunksize, extra = divmod(len(args), proc * 4)
+                if extra:
+                    chunksize += 1
 
-        # Compute Ricci curvature for edges
-        result = pool.imap_unordered(_wrap_compute_single_edge, args, chunksize=chunksize)
-        pool.close()
-        pool.join()
+            # Compute Ricci curvature for edges
+            result = pool.imap_unordered(_wrap_compute_single_edge, args, chunksize=chunksize)
+            pool.close()
+            pool.join()
 
     # Convert edge index from nk back to nx for final output
     output = {}
